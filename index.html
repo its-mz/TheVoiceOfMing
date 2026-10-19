@@ -1,0 +1,193 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>The Voice of Ming</title>
+<style>
+  :root { --bg:#0d0f12; --fg:#f2f2f2; --dim:#8a9099; --accent:#e8412c; --panel:#1a1d22; }
+  * { box-sizing:border-box; }
+  body { margin:0; background:var(--bg); color:var(--fg); font:18px/1.4 system-ui, sans-serif;
+         display:flex; flex-direction:column; align-items:center; padding:24px 16px; gap:20px; }
+  h1 { margin:0; font-size:22px; letter-spacing:.08em; text-transform:uppercase; color:var(--dim); }
+  .gauges { display:flex; gap:48px; flex-wrap:wrap; justify-content:center; }
+  .gauge { text-align:center; }
+  .big { font-size:96px; font-weight:700; font-variant-numeric:tabular-nums; line-height:1; }
+  .unit { color:var(--dim); }
+  #start { font-size:28px; font-weight:700; padding:22px 64px; border:0; border-radius:999px;
+           background:var(--accent); color:#fff; cursor:pointer; }
+  #start.on { background:#333; }
+  .panel { background:var(--panel); border-radius:16px; padding:18px 22px; width:min(640px,100%);
+           display:grid; grid-template-columns:auto 1fr auto; gap:14px 16px; align-items:center; }
+  input[type=range] { width:100%; height:36px; }
+  .row-full { grid-column:1 / -1; display:flex; gap:12px; flex-wrap:wrap; }
+  .seg button { font-size:18px; padding:12px 20px; border-radius:10px; border:1px solid #444;
+                background:transparent; color:var(--fg); }
+  .seg button.sel { background:var(--fg); color:var(--bg); }
+  #status { color:var(--dim); font-size:15px; text-align:center; min-height:1.4em; }
+</style>
+</head>
+<body>
+<h1>The Voice of Ming</h1>
+
+<div class="gauges">
+  <div class="gauge"><div class="big" id="speed">0</div><div class="unit" id="unitLabel">km/h</div></div>
+  <div class="gauge"><div class="big" id="gear">N</div><div class="unit">gear</div></div>
+  <div class="gauge"><div class="big" id="rpm">0</div><div class="unit">rpm</div></div>
+</div>
+
+<button id="start">START ENGINE</button>
+<div id="status">Tap start, then allow location access.</div>
+
+<div class="panel">
+  <div class="row-full seg" id="modeSeg">
+    <button data-mode="gps" class="sel">GPS drive</button>
+    <button data-mode="test">Test drive (parked)</button>
+  </div>
+  <label for="testSpeed">Test speed</label><input id="testSpeed" type="range" min="0" max="160" value="0"><span id="testSpeedVal">0</span>
+  <label for="volume">Volume</label><input id="volume" type="range" min="0" max="100" value="80"><span id="volumeVal">80%</span>
+  <div class="row-full seg" id="unitSeg">
+    <button data-unit="kmh" class="sel">km/h</button>
+    <button data-unit="mph">mph</button>
+  </div>
+</div>
+
+<script>
+// ---------- Engine model ----------
+const ENGINE = {
+  cylinders: 8, idle: 800, redline: 6500, shiftUp: 5800, shiftDown: 2200,
+  // km/h per 1000 rpm in each gear
+  gears: [9, 15, 22, 30, 38, 47],
+};
+
+let ctx, nodes, mode = 'gps', unit = 'kmh';
+let targetKmh = 0, shownKmh = 0, prevKmh = 0, gear = 1, rpm = ENGINE.idle, throttle = 0;
+let watchId = null, lastFix = null;
+
+const $ = id => document.getElementById(id);
+
+function buildAudio() {
+  ctx = new (window.AudioContext || window.webkitAudioContext)();
+  const master = ctx.createGain(); master.gain.value = 0;
+  const comp = ctx.createDynamicsCompressor();
+  master.connect(comp).connect(ctx.destination);
+
+  const filter = ctx.createBiquadFilter(); filter.type = 'lowpass'; filter.Q.value = 4;
+  filter.connect(master);
+
+  // Firing-frequency saw + half-rate square for the "lumpy" V8 burble
+  const saw = ctx.createOscillator(); saw.type = 'sawtooth';
+  const sub = ctx.createOscillator(); sub.type = 'square';
+  const sawG = ctx.createGain(); sawG.gain.value = 0.5;
+  const subG = ctx.createGain(); subG.gain.value = 0.35;
+  saw.connect(sawG).connect(filter); sub.connect(subG).connect(filter);
+
+  // Slow amplitude wobble = uneven firing
+  const lfo = ctx.createOscillator(); lfo.type = 'triangle';
+  const lfoG = ctx.createGain(); lfoG.gain.value = 0.15;
+  lfo.connect(lfoG).connect(sawG.gain);
+
+  // Noise through a bandpass = intake/exhaust rasp
+  const buf = ctx.createBuffer(1, ctx.sampleRate * 2, ctx.sampleRate);
+  const d = buf.getChannelData(0); for (let i = 0; i < d.length; i++) d[i] = Math.random() * 2 - 1;
+  const noise = ctx.createBufferSource(); noise.buffer = buf; noise.loop = true;
+  const bp = ctx.createBiquadFilter(); bp.type = 'bandpass'; bp.Q.value = 1.5;
+  const noiseG = ctx.createGain(); noiseG.gain.value = 0.08;
+  noise.connect(bp).connect(noiseG).connect(filter);
+
+  [saw, sub, lfo, noise].forEach(n => n.start());
+  nodes = { master, filter, saw, sub, lfo, bp, noiseG };
+}
+
+function updateAudio() {
+  const t = ctx.currentTime, k = 0.05;
+  const fire = rpm / 60 * ENGINE.cylinders / 2;           // firing frequency (Hz)
+  nodes.saw.frequency.setTargetAtTime(fire, t, k);
+  nodes.sub.frequency.setTargetAtTime(fire / 2, t, k);
+  nodes.lfo.frequency.setTargetAtTime(fire / 4, t, k);
+  nodes.bp.frequency.setTargetAtTime(fire * 3, t, k);
+  nodes.filter.frequency.setTargetAtTime(300 + rpm * 0.25 + throttle * 2500, t, k);
+  nodes.noiseG.gain.setTargetAtTime(0.04 + throttle * 0.12, t, k);
+  const vol = $('volume').value / 100;
+  nodes.master.gain.setTargetAtTime(vol * (0.35 + 0.65 * Math.max(throttle, rpm / ENGINE.redline * 0.6)), t, k);
+}
+
+// ---------- Drivetrain ----------
+function step(dt) {
+  const src = mode === 'test' ? +$('testSpeed').value * (unit === 'mph' ? 1.609 : 1) : targetKmh;
+  // GPS arrives ~1 Hz, so glide toward it instead of jumping
+  shownKmh += (src - shownKmh) * Math.min(1, dt * 2.5);
+  const accel = (shownKmh - prevKmh) / Math.max(dt, 1e-3);  // km/h per second
+  prevKmh = shownKmh;
+  throttle += (Math.max(0, Math.min(1, accel / 8)) - throttle) * Math.min(1, dt * 4);
+
+  if (shownKmh < 2) { gear = 0; rpm += (ENGINE.idle - rpm) * Math.min(1, dt * 3); return; }
+  if (gear === 0) gear = 1;
+  const rpmIn = g => shownKmh / ENGINE.gears[g - 1] * 1000;
+  if (rpmIn(gear) > ENGINE.shiftUp && gear < ENGINE.gears.length) gear++;
+  else if (rpmIn(gear) < ENGINE.shiftDown && gear > 1) gear--;
+  const want = Math.max(ENGINE.idle, Math.min(ENGINE.redline, rpmIn(gear)));
+  rpm += (want - rpm) * Math.min(1, dt * 8);
+}
+
+function render() {
+  const s = unit === 'mph' ? shownKmh / 1.609 : shownKmh;
+  $('speed').textContent = Math.round(s);
+  $('gear').textContent = gear === 0 ? 'N' : gear;
+  $('rpm').textContent = Math.round(rpm / 50) * 50;
+}
+
+let last = performance.now();
+function loop(now) {
+  const dt = (now - last) / 1000; last = now;
+  step(dt); render(); if (ctx) updateAudio();
+  requestAnimationFrame(loop);
+}
+requestAnimationFrame(loop);
+
+// ---------- GPS ----------
+function onFix(p) {
+  let mps = p.coords.speed;
+  if ((mps == null || isNaN(mps)) && lastFix) {           // fall back to distance / time
+    const R = 6371000, toR = x => x * Math.PI / 180;
+    const dLat = toR(p.coords.latitude - lastFix.coords.latitude);
+    const dLon = toR(p.coords.longitude - lastFix.coords.longitude);
+    const a = Math.sin(dLat/2)**2 + Math.cos(toR(lastFix.coords.latitude)) * Math.cos(toR(p.coords.latitude)) * Math.sin(dLon/2)**2;
+    const dist = 2 * R * Math.asin(Math.sqrt(a));
+    const sec = (p.timestamp - lastFix.timestamp) / 1000;
+    mps = sec > 0 ? dist / sec : 0;
+  }
+  lastFix = p;
+  targetKmh = Math.max(0, (mps || 0) * 3.6);
+  $('status').textContent = `GPS ok · accuracy ±${Math.round(p.coords.accuracy)} m`;
+}
+function startGps() {
+  if (!navigator.geolocation) { $('status').textContent = 'No geolocation in this browser.'; return; }
+  watchId = navigator.geolocation.watchPosition(onFix,
+    e => $('status').textContent = 'Location error: ' + e.message,
+    { enableHighAccuracy: true, maximumAge: 0, timeout: 10000 });
+}
+
+// ---------- UI ----------
+$('start').onclick = async () => {
+  if (!ctx) { buildAudio(); startGps(); }
+  if (ctx.state === 'running') { await ctx.suspend(); $('start').textContent = 'START ENGINE'; $('start').classList.remove('on'); }
+  else { await ctx.resume(); $('start').textContent = 'STOP ENGINE'; $('start').classList.add('on'); }
+};
+$('modeSeg').onclick = e => {
+  const b = e.target.closest('button'); if (!b) return;
+  mode = b.dataset.mode;
+  [...$('modeSeg').children].forEach(x => x.classList.toggle('sel', x === b));
+};
+$('unitSeg').onclick = e => {
+  const b = e.target.closest('button'); if (!b) return;
+  unit = b.dataset.unit;
+  [...$('unitSeg').children].forEach(x => x.classList.toggle('sel', x === b));
+  $('unitLabel').textContent = unit === 'mph' ? 'mph' : 'km/h';
+  $('testSpeed').max = unit === 'mph' ? 100 : 160;
+};
+$('testSpeed').oninput = () => $('testSpeedVal').textContent = $('testSpeed').value;
+$('volume').oninput = () => $('volumeVal').textContent = $('volume').value + '%';
+</script>
+</body>
+</html>
