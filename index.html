@@ -149,6 +149,7 @@ requestAnimationFrame(loop);
 
 // ---------- GPS ----------
 let fixCount = 0, rawMps = null, derivedMps = 0;
+const MAX_MPS = 300 / 3.6, STALE_MS = 15000;
 const history = [];                                        // recent fixes, for distance / time speed
 
 function metersBetween(a, b) {
@@ -168,14 +169,16 @@ function onFix(p) {
   derivedMps = 0;
   const first = history[0];
   const sec = (fix.t - first.t) / 1000;
-  if (sec > 0) {
+  if (sec >= 1) {
     const dist = metersBetween(first, fix);
     if (dist > Math.max(fix.acc, first.acc) * 0.5) derivedMps = dist / sec;
   }
+  // Wi-Fi location can teleport; a "speed" above ~300 km/h is a bad fix, not driving. Start over from here.
+  if (derivedMps > MAX_MPS) { derivedMps = 0; history.splice(0, history.length - 1); }
 
   // Real GPS (Tesla, phones) reports speed directly; laptops often report null or a constant 0
   rawMps = p.coords.speed;
-  const mps = rawMps != null && !isNaN(rawMps) && rawMps > 0 ? rawMps : derivedMps;
+  const mps = rawMps != null && !isNaN(rawMps) && rawMps > 0 && rawMps < MAX_MPS ? rawMps : derivedMps;
   targetKmh = Math.max(0, mps * 3.6);
   lastFix = p;
   $('status').textContent = `GPS ok · accuracy ±${Math.round(fix.acc)} m`;
@@ -188,7 +191,10 @@ setInterval(() => {
   const raw = rawMps == null || isNaN(rawMps) ? 'none' : (rawMps * 3.6).toFixed(1);
   $('debug').textContent = `fixes ${fixCount} · last ${age}s ago · device speed ${raw} · from movement ${(derivedMps * 3.6).toFixed(1)} km/h`;
   // No fix for a while: assume stopped rather than freezing at the last speed
-  if (lastFix && Date.now() - lastFix.timestamp > 15000) targetKmh = 0;
+  if (lastFix && Date.now() - lastFix.timestamp > STALE_MS) {
+    targetKmh = 0;
+    $('status').textContent = '⚠ No location updates for ' + age + 's. This device probably has no GPS chip; try a phone or the car browser.';
+  }
 }, 1000);
 function startGps() {
   if (!navigator.geolocation) { $('status').textContent = 'No geolocation in this browser.'; return; }
