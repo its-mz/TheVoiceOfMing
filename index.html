@@ -25,6 +25,7 @@
                 background:transparent; color:var(--fg); }
   .seg button.sel { background:var(--fg); color:var(--bg); }
   #status { color:var(--dim); font-size:15px; text-align:center; min-height:1.4em; }
+  #debug { color:var(--dim); font:13px ui-monospace, monospace; text-align:center; margin-top:-12px; }
 </style>
 </head>
 <body>
@@ -38,6 +39,7 @@
 
 <button id="start">START ENGINE</button>
 <div id="status">Tap start, then allow location access.</div>
+<div id="debug"></div>
 
 <div class="panel">
   <div class="row-full seg" id="modeSeg">
@@ -146,21 +148,48 @@ function loop(now) {
 requestAnimationFrame(loop);
 
 // ---------- GPS ----------
-function onFix(p) {
-  let mps = p.coords.speed;
-  if ((mps == null || isNaN(mps)) && lastFix) {           // fall back to distance / time
-    const R = 6371000, toR = x => x * Math.PI / 180;
-    const dLat = toR(p.coords.latitude - lastFix.coords.latitude);
-    const dLon = toR(p.coords.longitude - lastFix.coords.longitude);
-    const a = Math.sin(dLat/2)**2 + Math.cos(toR(lastFix.coords.latitude)) * Math.cos(toR(p.coords.latitude)) * Math.sin(dLon/2)**2;
-    const dist = 2 * R * Math.asin(Math.sqrt(a));
-    const sec = (p.timestamp - lastFix.timestamp) / 1000;
-    mps = sec > 0 ? dist / sec : 0;
-  }
-  lastFix = p;
-  targetKmh = Math.max(0, (mps || 0) * 3.6);
-  $('status').textContent = `GPS ok · accuracy ±${Math.round(p.coords.accuracy)} m`;
+let fixCount = 0, rawMps = null, derivedMps = 0;
+const history = [];                                        // recent fixes, for distance / time speed
+
+function metersBetween(a, b) {
+  const R = 6371000, toR = x => x * Math.PI / 180;
+  const dLat = toR(b.lat - a.lat), dLon = toR(b.lon - a.lon);
+  const h = Math.sin(dLat/2)**2 + Math.cos(toR(a.lat)) * Math.cos(toR(b.lat)) * Math.sin(dLon/2)**2;
+  return 2 * R * Math.asin(Math.sqrt(h));
 }
+
+function onFix(p) {
+  fixCount++;
+  const fix = { lat: p.coords.latitude, lon: p.coords.longitude, t: p.timestamp, acc: p.coords.accuracy };
+  history.push(fix);
+  while (history.length > 2 && fix.t - history[0].t > 10000) history.shift();
+
+  // Speed from movement over the last few seconds; ignore drift smaller than the fix accuracy
+  derivedMps = 0;
+  const first = history[0];
+  const sec = (fix.t - first.t) / 1000;
+  if (sec > 0) {
+    const dist = metersBetween(first, fix);
+    if (dist > Math.max(fix.acc, first.acc) * 0.5) derivedMps = dist / sec;
+  }
+
+  // Real GPS (Tesla, phones) reports speed directly; laptops often report null or a constant 0
+  rawMps = p.coords.speed;
+  const mps = rawMps != null && !isNaN(rawMps) && rawMps > 0 ? rawMps : derivedMps;
+  targetKmh = Math.max(0, mps * 3.6);
+  lastFix = p;
+  $('status').textContent = `GPS ok · accuracy ±${Math.round(fix.acc)} m`;
+}
+
+// Debug readout so you can see what the device is actually sending
+setInterval(() => {
+  if (!fixCount) return;
+  const age = lastFix ? ((Date.now() - lastFix.timestamp) / 1000).toFixed(0) : '–';
+  const raw = rawMps == null || isNaN(rawMps) ? 'none' : (rawMps * 3.6).toFixed(1);
+  $('debug').textContent = `fixes ${fixCount} · last ${age}s ago · device speed ${raw} · from movement ${(derivedMps * 3.6).toFixed(1)} km/h`;
+  // No fix for a while: assume stopped rather than freezing at the last speed
+  if (lastFix && Date.now() - lastFix.timestamp > 15000) targetKmh = 0;
+}, 1000);
 function startGps() {
   if (!navigator.geolocation) { $('status').textContent = 'No geolocation in this browser.'; return; }
   watchId = navigator.geolocation.watchPosition(onFix,
