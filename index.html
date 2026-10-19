@@ -48,6 +48,7 @@
   </div>
   <label for="testSpeed">Test speed</label><input id="testSpeed" type="range" min="0" max="160" value="0"><span id="testSpeedVal">0</span>
   <label for="volume">Volume</label><input id="volume" type="range" min="0" max="100" value="80"><span id="volumeVal">80%</span>
+  <label for="crackle">Crackle</label><input id="crackle" type="range" min="0" max="100" value="60"><span id="crackleVal">60%</span>
   <div class="row-full seg" id="unitSeg">
     <button data-unit="kmh" class="sel">km/h</button>
     <button data-unit="mph">mph</button>
@@ -55,81 +56,174 @@
 </div>
 
 <script>
-// ---------- Engine model ----------
+// ---------- Engine model: 2006–2015 Mazda MX-5 (NC), 2.0 L MZR inline-4, 6-speed manual ----------
 const ENGINE = {
-  cylinders: 8, idle: 800, redline: 6500, shiftUp: 5800, shiftDown: 2200,
-  // km/h per 1000 rpm in each gear
-  gears: [9, 15, 22, 30, 38, 47],
+  idle: 850, redline: 7200,
+  ratios: [3.815, 2.260, 1.640, 1.177, 1.000, 0.832],
+  finalDrive: 3.909,
+  tireCircM: 1.921,                                       // 205/50R16
 };
+// km/h per 1000 rpm in each gear
+const KMH_PER_1000 = ENGINE.ratios.map(r => 1000 / (r * ENGINE.finalDrive) * ENGINE.tireCircM * 60 / 1000);
 
-let ctx, nodes, mode = 'gps', unit = 'kmh';
+let ctx, nodes, noiseBuf, mode = 'gps', unit = 'kmh';
 let targetKmh = 0, shownKmh = 0, prevKmh = 0, gear = 1, rpm = ENGINE.idle, throttle = 0;
 let watchId = null, lastFix = null;
+let lastShift = 0, shiftCutUntil = 0, blipUntil = 0, crackleUntil = 0, throttlePeak = 0, overrun = false;
 
 const $ = id => document.getElementById(id);
+const lerp = (a, b, x) => a + (b - a) * x;
+const clamp01 = x => Math.max(0, Math.min(1, x));
 
-function buildAudio() {
-  ctx = new (window.AudioContext || window.webkitAudioContext)();
+function buildAudio(c = new (window.AudioContext || window.webkitAudioContext)()) {
+  ctx = c;
   const master = ctx.createGain(); master.gain.value = 0;
   const comp = ctx.createDynamicsCompressor();
   master.connect(comp).connect(ctx.destination);
 
-  const filter = ctx.createBiquadFilter(); filter.type = 'lowpass'; filter.Q.value = 4;
-  filter.connect(master);
+  noiseBuf = ctx.createBuffer(1, ctx.sampleRate * 2, ctx.sampleRate);
+  const d = noiseBuf.getChannelData(0); for (let i = 0; i < d.length; i++) d[i] = Math.random() * 2 - 1;
 
-  // Firing-frequency saw + half-rate square for the "lumpy" V8 burble
-  const saw = ctx.createOscillator(); saw.type = 'sawtooth';
-  const sub = ctx.createOscillator(); sub.type = 'square';
-  const sawG = ctx.createGain(); sawG.gain.value = 0.5;
-  const subG = ctx.createGain(); subG.gain.value = 0.35;
-  saw.connect(sawG).connect(filter); sub.connect(subG).connect(filter);
+  // Exhaust pulse train: an inline-4 fires twice per revolution, evenly spaced.
+  // A sharp pulse has a rich, slowly falling harmonic series, which reads as "raspy" rather than a V8's burble.
+  const N = 48, real = new Float32Array(N), imag = new Float32Array(N);
+  for (let n = 1; n < N; n++) imag[n] = (n % 2 ? 1 : 0.75) / Math.pow(n, 0.75);
+  const pulse = ctx.createOscillator(); pulse.setPeriodicWave(ctx.createPeriodicWave(real, imag));
+  const pulseG = ctx.createGain(); pulseG.gain.value = 0.5;
 
-  // Slow amplitude wobble = uneven firing
-  const lfo = ctx.createOscillator(); lfo.type = 'triangle';
-  const lfoG = ctx.createGain(); lfoG.gain.value = 0.15;
-  lfo.connect(lfoG).connect(sawG.gain);
+  // Once-per-rev component: small cylinder-to-cylinder imbalance so it isn't a perfect buzz
+  const crank = ctx.createOscillator(); crank.type = 'triangle';
+  const crankG = ctx.createGain(); crankG.gain.value = 0.12;
 
-  // Noise through a bandpass = intake/exhaust rasp
-  const buf = ctx.createBuffer(1, ctx.sampleRate * 2, ctx.sampleRate);
-  const d = buf.getChannelData(0); for (let i = 0; i < d.length; i++) d[i] = Math.random() * 2 - 1;
-  const noise = ctx.createBufferSource(); noise.buffer = buf; noise.loop = true;
-  const bp = ctx.createBiquadFilter(); bp.type = 'bandpass'; bp.Q.value = 1.5;
-  const noiseG = ctx.createGain(); noiseG.gain.value = 0.08;
-  noise.connect(bp).connect(noiseG).connect(filter);
+  // Noise chopped by the firing pulses = straight-pipe rasp
+  const noise = ctx.createBufferSource(); noise.buffer = noiseBuf; noise.loop = true;
+  const noiseHp = ctx.createBiquadFilter(); noiseHp.type = 'highpass'; noiseHp.frequency.value = 500;
+  const noiseAmp = ctx.createGain(); noiseAmp.gain.value = 0.05;
+  const chop = ctx.createOscillator(); chop.type = 'square';
+  const chopDepth = ctx.createGain(); chopDepth.gain.value = 0.05;
+  chop.connect(chopDepth).connect(noiseAmp.gain);
+  noise.connect(noiseHp).connect(noiseAmp);
 
-  [saw, sub, lfo, noise].forEach(n => n.start());
-  nodes = { master, filter, saw, sub, lfo, bp, noiseG };
+  // Mix → drive → soft clip (harder with throttle) → tone shaping
+  const mix = ctx.createGain();
+  pulse.connect(pulseG).connect(mix); crank.connect(crankG).connect(mix); noiseAmp.connect(mix);
+  const drive = ctx.createGain(); drive.gain.value = 1;
+  const shaper = ctx.createWaveShaper();
+  const curve = new Float32Array(2048);
+  for (let i = 0; i < curve.length; i++) { const x = i / 1024 - 1; curve[i] = Math.tanh(2.5 * x); }
+  shaper.curve = curve; shaper.oversample = '2x';
+  const post = ctx.createGain(); post.gain.value = 0.35;   // undo the drive's loudness
+  const tone = ctx.createBiquadFilter(); tone.type = 'lowpass'; tone.Q.value = 0.9;
+  // No muffler: an open pipe resonance gives the highway "drone" around 3,000–3,300 rpm…
+  const drone = ctx.createBiquadFilter(); drone.type = 'peaking'; drone.frequency.value = 105; drone.Q.value = 3; drone.gain.value = 6;
+  // …and a nasal mid-range honk/rasp that grows with load
+  const rasp = ctx.createBiquadFilter(); rasp.type = 'peaking'; rasp.Q.value = 1.4;
+  mix.connect(drive).connect(shaper).connect(post).connect(tone).connect(drone).connect(rasp).connect(master);
+
+  // Pops and crackles bypass the tone filter so they stay sharp
+  const crackleBus = ctx.createGain(); crackleBus.gain.value = 0.9;
+  crackleBus.connect(master);
+
+  [pulse, crank, noise, chop].forEach(n => n.start());
+  nodes = { master, pulse, crank, chop, noiseAmp, chopDepth, drive, tone, rasp, crackleBus };
 }
 
-function updateAudio() {
-  const t = ctx.currentTime, k = 0.05;
-  const fire = rpm / 60 * ENGINE.cylinders / 2;           // firing frequency (Hz)
-  nodes.saw.frequency.setTargetAtTime(fire, t, k);
-  nodes.sub.frequency.setTargetAtTime(fire / 2, t, k);
-  nodes.lfo.frequency.setTargetAtTime(fire / 4, t, k);
-  nodes.bp.frequency.setTargetAtTime(fire * 3, t, k);
-  nodes.filter.frequency.setTargetAtTime(300 + rpm * 0.25 + throttle * 2500, t, k);
-  nodes.noiseG.gain.setTargetAtTime(0.04 + throttle * 0.12, t, k);
+// One exhaust pop: a sharp band-passed noise crack plus a short low thump
+function pop(time, strength) {
+  const src = ctx.createBufferSource(); src.buffer = noiseBuf;
+  const bp = ctx.createBiquadFilter(); bp.type = 'bandpass';
+  bp.frequency.value = 800 + Math.random() * 2600; bp.Q.value = 0.7;
+  const g = ctx.createGain();
+  const len = 0.015 + Math.random() * 0.05;
+  g.gain.setValueAtTime(0, time);
+  g.gain.linearRampToValueAtTime(strength, time + 0.002);
+  g.gain.exponentialRampToValueAtTime(0.001, time + len);
+  src.connect(bp).connect(g).connect(nodes.crackleBus);
+  src.start(time, Math.random() * 1.8, len + 0.02);
+
+  const o = ctx.createOscillator();
+  o.frequency.setValueAtTime(90 + Math.random() * 70, time);
+  o.frequency.exponentialRampToValueAtTime(40, time + 0.06);
+  const og = ctx.createGain();
+  og.gain.setValueAtTime(strength * 0.7, time);
+  og.gain.exponentialRampToValueAtTime(0.001, time + 0.07);
+  o.connect(og).connect(nodes.crackleBus); o.start(time); o.stop(time + 0.08);
+}
+
+function updateAudio(dt) {
+  const t = ctx.currentTime, k = 0.03;
+  const fire = rpm / 30;                                   // inline-4: 2 firings per rev (Hz)
+  const jitter = 1 + (Math.random() - 0.5) * 0.008;        // tiny combustion irregularity
+  nodes.pulse.frequency.setTargetAtTime(fire * jitter, t, k);
+  nodes.chop.frequency.setTargetAtTime(fire, t, k);
+  nodes.crank.frequency.setTargetAtTime(rpm / 60, t, k);
+
+  const load = throttle, r = rpm / ENGINE.redline;
+  nodes.drive.gain.setTargetAtTime(0.8 + load * 2.6 + r * 0.8, t, k);
+  nodes.noiseAmp.gain.setTargetAtTime(0.03 + load * 0.18 + r * 0.06, t, k);
+  nodes.chopDepth.gain.setTargetAtTime(0.03 + load * 0.18 + r * 0.06, t, k);
+  nodes.tone.frequency.setTargetAtTime(500 + rpm * 0.45 + load * 3200, t, k);
+  nodes.rasp.frequency.setTargetAtTime(950 + rpm * 0.06, t, k);
+  nodes.rasp.gain.setTargetAtTime(2 + load * 7, t, k);
+
   const vol = $('volume').value / 100;
-  nodes.master.gain.setTargetAtTime(vol * (0.35 + 0.65 * Math.max(throttle, rpm / ENGINE.redline * 0.6)), t, k);
+  nodes.master.gain.setTargetAtTime(vol * (0.22 + 0.45 * load + 0.33 * r), t, k);
+
+  // Crackle: a burst after lifting off from high revs, plus the odd pop on a long overrun
+  const amount = $('crackle').value / 100;
+  const now = performance.now();
+  let rate = 0;                                            // pops per second
+  if (now < crackleUntil) rate = 16;
+  else if (overrun && rpm > 3000) rate = 2.5;
+  rate *= amount;
+  if (rate > 0 && Math.random() < rate * dt) {
+    const strength = (0.25 + Math.random() * 0.5) * (0.5 + 0.5 * amount);
+    pop(t, strength);
+    // pops come in little clusters
+    for (let i = 0, n = Math.floor(Math.random() * 3); i < n; i++) pop(t + 0.025 + Math.random() * 0.06, strength * (0.4 + Math.random() * 0.5));
+  }
 }
 
 // ---------- Drivetrain ----------
 function step(dt) {
+  const now = performance.now();
   const src = mode === 'test' ? +$('testSpeed').value * (unit === 'mph' ? 1.609 : 1) : targetKmh;
   // GPS arrives ~1 Hz, so glide toward it instead of jumping
   shownKmh += (src - shownKmh) * Math.min(1, dt * 2.5);
   const accel = (shownKmh - prevKmh) / Math.max(dt, 1e-3);  // km/h per second
   prevKmh = shownKmh;
-  throttle += (Math.max(0, Math.min(1, accel / 8)) - throttle) * Math.min(1, dt * 4);
+
+  // Throttle guess: acceleration (an NC pulls ~12 km/h/s flat out in 2nd) plus a little road load when cruising
+  overrun = accel < -1.5;
+  let want = overrun ? 0 : clamp01(accel / 12 + (shownKmh > 5 ? 0.12 : 0));
+  if (now < shiftCutUntil) want = 0;                       // clutch in during an upshift
+  if (now < blipUntil) want = 0.6;                         // heel-toe blip on a downshift
+  throttle += (want - throttle) * Math.min(1, dt * 6);
+
+  // Lift-off from real load at high rpm → crackle burst
+  throttlePeak = Math.max(throttle, throttlePeak - dt * 0.8);
+  if (want < 0.05 && throttlePeak > 0.35 && rpm > 3200 && now > crackleUntil + 1500) {
+    crackleUntil = now + 700 + Math.random() * 1100;
+    throttlePeak = 0;
+  }
 
   if (shownKmh < 2) { gear = 0; rpm += (ENGINE.idle - rpm) * Math.min(1, dt * 3); return; }
   if (gear === 0) gear = 1;
-  const rpmIn = g => shownKmh / ENGINE.gears[g - 1] * 1000;
-  if (rpmIn(gear) > ENGINE.shiftUp && gear < ENGINE.gears.length) gear++;
-  else if (rpmIn(gear) < ENGINE.shiftDown && gear > 1) gear--;
-  const want = Math.max(ENGINE.idle, Math.min(ENGINE.redline, rpmIn(gear)));
-  rpm += (want - rpm) * Math.min(1, dt * 8);
+  const rpmIn = g => shownKmh / KMH_PER_1000[g - 1] * 1000;
+  // Short-shift when cruising, wring it out under load
+  const upAt = lerp(3000, 6900, clamp01(throttle * 1.4));
+  const downAt = lerp(1400, 2600, throttle);
+  if (now - lastShift > 700) {
+    if (rpmIn(gear) > upAt && gear < ENGINE.ratios.length) {
+      gear++; lastShift = now; shiftCutUntil = now + 180;
+      if (rpm > 4500) crackleUntil = now + 250;            // a pop or two on a hard upshift
+    } else if (rpmIn(gear) < downAt && gear > 1) {
+      gear--; lastShift = now;
+      if (throttle < 0.2) blipUntil = now + 140;
+    }
+  }
+  const target = Math.max(ENGINE.idle, Math.min(ENGINE.redline, rpmIn(gear)));
+  rpm += (target - rpm) * Math.min(1, dt * 8);
 }
 
 function render() {
@@ -142,7 +236,7 @@ function render() {
 let last = performance.now();
 function loop(now) {
   const dt = (now - last) / 1000; last = now;
-  step(dt); render(); if (ctx) updateAudio();
+  step(dt); render(); if (ctx) updateAudio(dt);
   requestAnimationFrame(loop);
 }
 requestAnimationFrame(loop);
@@ -223,6 +317,7 @@ $('unitSeg').onclick = e => {
 };
 $('testSpeed').oninput = () => $('testSpeedVal').textContent = $('testSpeed').value;
 $('volume').oninput = () => $('volumeVal').textContent = $('volume').value + '%';
+$('crackle').oninput = () => $('crackleVal').textContent = $('crackle').value + '%';
 </script>
 </body>
 </html>
