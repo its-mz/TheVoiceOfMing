@@ -69,7 +69,7 @@ const KMH_PER_1000 = ENGINE.ratios.map(r => 1000 / (r * ENGINE.finalDrive) * ENG
 let ctx, nodes, noiseBuf, mode = 'gps', unit = 'kmh';
 let targetKmh = 0, midKmh = 0, shownKmh = 0, prevKmh = 0, accel = 0, gear = 1, rpm = ENGINE.idle, throttle = 0, drivePace = 0;
 let watchId = null, lastFix = null;
-let lastShift = 0, shiftCutUntil = 0, blipUntil = 0, crackleUntil = 0, lastLiftCrackle = 0, throttlePeak = 0, overrun = false;
+let lastShift = 0, upWantSince = 0, shiftCutUntil = 0, blipUntil = 0, crackleUntil = 0, lastLiftCrackle = 0, throttlePeak = 0, overrun = false;
 
 const $ = id => document.getElementById(id);
 const lerp = (a, b, x) => a + (b - a) * x;
@@ -194,7 +194,7 @@ function step(dt) {
   shownKmh += (midKmh - shownKmh) * a1;
   const rawAccel = (shownKmh - prevKmh) / Math.max(dt, 1e-3);  // km/h per second
   prevKmh = shownKmh;
-  accel += (rawAccel - accel) * (1 - Math.exp(-dt / 1.2));
+  accel += (rawAccel - accel) * (1 - Math.exp(-dt / 0.8));
 
   // Throttle guess: acceleration (an NC pulls ~12 km/h/s flat out in 2nd) plus a little road load when cruising.
   // Small speed changes are just GPS noise or holding speed, so treat them as steady cruise.
@@ -226,23 +226,42 @@ function step(dt) {
   if (shownKmh < 2) { gear = 0; rpm += (ENGINE.idle - rpm) * Math.min(1, dt * 3); return; }
   if (gear === 0) gear = 1;
   const rpmIn = g => shownKmh / KMH_PER_1000[g - 1] * 1000;
-  // Short-shift when cruising, wring it out under load
-  // Wide gap between up/down points + minimum time in gear = no gear hunting at a steady speed
-  // pace = load above plain cruising (0.15), so steady driving short-shifts like a normal driver
-  const pace = clamp01((drivePace - 0.15) / 0.85);
-  const upAt = lerp(2800, 6900, clamp01(Math.max(pace, (throttle - 0.45) / 0.55) * 1.3));
-  const downAt = lerp(1300, 2400, pace);
-  if (now - lastShift > 2000) {
-    // Nobody upshifts while coasting or easing off the gas (unless about to hit the limiter).
-    // Easing off = throttle well below the recent average; GPS smoothing shows this before real decel.
-    const coasting = overrun || driverWant < 0.05 || throttle < drivePace - 0.2;
-    if (rpmIn(gear) > (coasting ? ENGINE.redline - 200 : upAt) && gear < ENGINE.ratios.length) {
-      gear++; lastShift = now; shiftCutUntil = now + 180;
-      if (rpm > 4500) crackleUntil = now + 250;            // a pop or two on a hard upshift
-    } else if (rpmIn(gear) < downAt && gear > 1) {
-      gear--; lastShift = now;
-      if (throttle < 0.2) blipUntil = now + 140;
-    }
+  // ---- Sport-mode automatic shift schedule ----
+  // Load 0 = cruising, 1 = flat out. Upshift and kickdown rpm both rise with load, like a real
+  // automatic's shift map. Upshifts also consider recent hard driving, so sport mode holds a gear for
+  // a moment after a pull instead of short-shifting right away; kickdowns react to the current load only.
+  const loadNow = clamp01((throttle - 0.15) / 0.7);
+  const loadUp = Math.max(loadNow, 0.6 * clamp01((drivePace - 0.15) / 0.7));
+  const UP = [2500, 6800], DOWN = [1300, 4800];           // [cruise, flat out]
+  const upAt = lerp(UP[0], UP[1], loadUp);
+  let downAt = lerp(DOWN[0], DOWN[1], loadNow);
+  const braking = accel < -4;
+  if (braking) downAt = Math.max(downAt, 2700);           // sport mode drops gears under braking
+  const since = now - lastShift;
+  const top = ENGINE.ratios.length;
+
+  // Upshift: off the gas never upshifts (except at the limiter); otherwise past the shift point for a beat
+  const coasting = overrun || driverWant < 0.05;
+  const upLimit = coasting ? ENGINE.redline - 200 : upAt;
+  const atLimiter = rpmIn(gear) > ENGINE.redline - 300;
+  const upOk = gear < top && rpmIn(gear) > upLimit;
+  if (upOk) upWantSince ||= now; else upWantSince = 0;
+  const upDelay = atLimiter ? 0 : 350;
+
+  if (upWantSince && now - upWantSince >= upDelay && since > 900) {
+    gear++; lastShift = now; shiftCutUntil = now + 160;
+    upWantSince = 0;
+    if (rpm > 4500) crackleUntil = now + 250;              // a pop or two on a hard upshift
+  }
+  // Anti-hunting: never drop into a gear that would immediately want to upshift again.
+  // Under braking upshifts are off anyway, so allow lower gears up to ~3,800 rpm there.
+  const downCeiling = Math.min(braking ? Math.max(upAt - 400, 3800) : upAt - 400, 6300);
+  if (lastShift !== now && gear > 1 && rpmIn(gear) < downAt && rpmIn(gear - 1) < downCeiling && since > (braking ? 700 : 450)) {
+    // Kickdown / braking downshift: may skip gears (6→3), landing in the band where it wants to stay
+    let g = gear - 1;
+    while (g > 1 && rpmIn(g) < downAt && rpmIn(g - 1) < downCeiling) g--;
+    gear = g; lastShift = now; upWantSince = 0;
+    if (throttle < 0.3) blipUntil = now + 140;             // rev-matched blip when not on the gas
   }
   const target = Math.max(ENGINE.idle, Math.min(ENGINE.redline, rpmIn(gear)));
   // Fast right after a shift (the revs really do drop that fast), smooth otherwise
