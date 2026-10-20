@@ -67,9 +67,9 @@ const ENGINE = {
 const KMH_PER_1000 = ENGINE.ratios.map(r => 1000 / (r * ENGINE.finalDrive) * ENGINE.tireCircM * 60 / 1000);
 
 let ctx, nodes, noiseBuf, mode = 'gps', unit = 'kmh';
-let targetKmh = 0, midKmh = 0, shownKmh = 0, prevKmh = 0, accel = 0, gear = 1, rpm = ENGINE.idle, throttle = 0, drivePace = 0;
+let targetKmh = 0, shownKmh = 0, soundKmh = 0, lastSrc = 0, srcChangedAt = 0, accel = 0, speedLog = [], gear = 1, rpm = ENGINE.idle, throttle = 0, drivePace = 0;
 let watchId = null, lastFix = null;
-let lastShift = 0, upWantSince = 0, shiftCutUntil = 0, blipUntil = 0, crackleUntil = 0, lastLiftCrackle = 0, throttlePeak = 0, overrun = false;
+let lastShift = 0, lastShiftWasDown = false, upWantSince = 0, shiftCutUntil = 0, blipUntil = 0, crackleUntil = 0, lastLiftCrackle = 0, throttlePeak = 0, overrun = false;
 
 const $ = id => document.getElementById(id);
 const lerp = (a, b, x) => a + (b - a) * x;
@@ -158,16 +158,18 @@ function updateAudio(dt) {
   nodes.chop.frequency.setTargetAtTime(fire, t, k);
   nodes.crank.frequency.setTargetAtTime(rpm / 60, t, k);
 
+  // Loudness/rasp glide a bit slower than pitch, so small throttle changes swell instead of clicking
+  const kLoad = 0.12;
   const load = throttle, r = rpm / ENGINE.redline;
-  nodes.drive.gain.setTargetAtTime(0.8 + load * 2.6 + r * 0.8, t, k);
-  nodes.noiseAmp.gain.setTargetAtTime(0.03 + load * 0.18 + r * 0.06, t, k);
-  nodes.chopDepth.gain.setTargetAtTime(0.03 + load * 0.18 + r * 0.06, t, k);
-  nodes.tone.frequency.setTargetAtTime(500 + rpm * 0.45 + load * 3200, t, k);
-  nodes.rasp.frequency.setTargetAtTime(950 + rpm * 0.06, t, k);
-  nodes.rasp.gain.setTargetAtTime(2 + load * 7, t, k);
+  nodes.drive.gain.setTargetAtTime(0.8 + load * 2.6 + r * 0.8, t, kLoad);
+  nodes.noiseAmp.gain.setTargetAtTime(0.03 + load * 0.18 + r * 0.06, t, kLoad);
+  nodes.chopDepth.gain.setTargetAtTime(0.03 + load * 0.18 + r * 0.06, t, kLoad);
+  nodes.tone.frequency.setTargetAtTime(500 + rpm * 0.45 + load * 3200, t, kLoad);
+  nodes.rasp.frequency.setTargetAtTime(950 + rpm * 0.06, t, kLoad);
+  nodes.rasp.gain.setTargetAtTime(2 + load * 7, t, kLoad);
 
   const vol = $('volume').value / 100;
-  nodes.master.gain.setTargetAtTime(vol * (0.22 + 0.45 * load + 0.33 * r), t, k);
+  nodes.master.gain.setTargetAtTime(vol * (0.22 + 0.45 * load + 0.33 * r), t, kLoad);
 
   // Crackle: a burst after lifting off from high revs, plus the odd pop on a long overrun
   const amount = $('crackle').value / 100;
@@ -188,17 +190,23 @@ function updateAudio(dt) {
 function step(dt) {
   const now = performance.now();
   const src = mode === 'test' ? +$('testSpeed').value * (unit === 'mph' ? 1.609 : 1) : targetKmh;
-  // GPS arrives ~1 Hz with a few km/h of noise. Two cascaded smoothers turn each step into a gentle S-curve.
-  const a1 = 1 - Math.exp(-dt / 0.7);
-  midKmh += (src - midKmh) * a1;
-  shownKmh += (midKmh - shownKmh) * a1;
-  const rawAccel = (shownKmh - prevKmh) / Math.max(dt, 1e-3);  // km/h per second
-  prevKmh = shownKmh;
-  accel += (rawAccel - accel) * (1 - Math.exp(-dt / 0.8));
+  // Speed is used raw: no filtering, so the sound reacts as soon as a GPS fix lands.
+  shownKmh = src;
+  if (src !== lastSrc) { lastSrc = src; srcChangedAt = now; }
+  // Acceleration = change over the last second (GPS updates once a second, so that's one fix to the next)
+  speedLog.push([now, src]);
+  while (speedLog.length > 2 && now - speedLog[1][0] >= 1000) speedLog.shift();
+  const [t0, v0] = speedLog[0];
+  accel = now - t0 > 50 ? (src - v0) / ((now - t0) / 1000) : 0;
+
+  // The engine's own speed: the sound side keeps the current trend going between fixes so the revs
+  // ramp instead of stepping once a second, then glides onto each new fix. Smoothing lives here, not on GPS.
+  const predicted = Math.max(0, src + accel * Math.min((now - srcChangedAt) / 1000, 1));
+  soundKmh += (predicted - soundKmh) * (1 - Math.exp(-dt / 0.15));
 
   // Throttle guess: acceleration (an NC pulls ~12 km/h/s flat out in 2nd) plus a little road load when cruising.
   // Small speed changes are just GPS noise or holding speed, so treat them as steady cruise.
-  const DEADBAND = 1.5;
+  const DEADBAND = 1.0;
   const effAccel = Math.abs(accel) < DEADBAND ? 0 : accel - Math.sign(accel) * DEADBAND;
   overrun = effAccel < -1.5;
   const driverWant = overrun ? 0 : clamp01(effAccel / 10 + (shownKmh > 5 ? 0.15 : 0));
@@ -207,13 +215,13 @@ function step(dt) {
   if (now < blipUntil) want = 0.6;                         // heel-toe blip on a downshift
   // Shift/blip changes are deliberate and quick; everything else eases in
   const quick = now < shiftCutUntil || now < blipUntil;
-  throttle += (want - throttle) * (1 - Math.exp(-dt / (quick ? 0.05 : 0.35)));
+  throttle += (want - throttle) * (1 - Math.exp(-dt / (quick ? 0.05 : 0.2)));
   // Slow "how hard am I driving" signal for shift points, so one noisy fix can't move them
   drivePace += (throttle - drivePace) * (1 - Math.exp(-dt / 2.5));
 
   // Lift-off from real load at high rpm → crackle burst
-  // Remember recent load for a few seconds: smoothed decel takes a moment to show up after you lift
-  throttlePeak = Math.max(throttle, throttlePeak - dt * 0.15);
+  // Remember recent load for a couple of seconds: decel shows up one GPS fix after you lift
+  throttlePeak = Math.max(throttle, throttlePeak - dt * 0.3);
   // Lifted = off the gas, or already slowing with throttle well under the recent average.
   // (driverWant, not want: the throttle cut during an upshift isn't a lift)
   const lifted = driverWant < 0.05 || (accel < -0.5 && throttle < drivePace - 0.3);
@@ -223,9 +231,9 @@ function step(dt) {
     throttlePeak = 0;
   }
 
-  if (shownKmh < 2) { gear = 0; rpm += (ENGINE.idle - rpm) * Math.min(1, dt * 3); return; }
+  if (soundKmh < 2) { gear = 0; rpm += (ENGINE.idle - rpm) * Math.min(1, dt * 3); return; }
   if (gear === 0) gear = 1;
-  const rpmIn = g => shownKmh / KMH_PER_1000[g - 1] * 1000;
+  const rpmIn = g => soundKmh / KMH_PER_1000[g - 1] * 1000;
   // ---- Sport-mode automatic shift schedule ----
   // Load 0 = cruising, 1 = flat out. Upshift and kickdown rpm both rise with load, like a real
   // automatic's shift map. Upshifts also consider recent hard driving, so sport mode holds a gear for
@@ -249,18 +257,18 @@ function step(dt) {
   const upDelay = atLimiter ? 0 : 350;
 
   if (upWantSince && now - upWantSince >= upDelay && since > 900) {
-    gear++; lastShift = now; shiftCutUntil = now + 160;
+    gear++; lastShift = now; lastShiftWasDown = false; shiftCutUntil = now + 160;
     upWantSince = 0;
     if (rpm > 4500) crackleUntil = now + 250;              // a pop or two on a hard upshift
   }
   // Anti-hunting: never drop into a gear that would immediately want to upshift again.
   // Under braking upshifts are off anyway, so allow lower gears up to ~3,800 rpm there.
   const downCeiling = Math.min(braking ? Math.max(upAt - 400, 3800) : upAt - 400, 6300);
-  if (lastShift !== now && gear > 1 && rpmIn(gear) < downAt && rpmIn(gear - 1) < downCeiling && since > (braking ? 700 : 450)) {
-    // Kickdown / braking downshift: may skip gears (6→3), landing in the band where it wants to stay
-    let g = gear - 1;
-    while (g > 1 && rpmIn(g) < downAt && rpmIn(g - 1) < downCeiling) g--;
-    gear = g; lastShift = now; upWantSince = 0;
+  // Downshifts go one gear at a time (5→4→3, never 5→2), rippling quickly on a kickdown
+  // and a little slower under braking, like a real sequential box
+  const downGap = lastShiftWasDown ? (braking ? 450 : 280) : 450;
+  if (lastShift !== now && gear > 1 && rpmIn(gear) < downAt && rpmIn(gear - 1) < downCeiling && since > downGap) {
+    gear--; lastShift = now; lastShiftWasDown = true; upWantSince = 0;
     if (throttle < 0.3) blipUntil = now + 140;             // rev-matched blip when not on the gas
   }
   const target = Math.max(ENGINE.idle, Math.min(ENGINE.redline, rpmIn(gear)));
