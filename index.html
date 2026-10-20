@@ -67,9 +67,9 @@ const ENGINE = {
 const KMH_PER_1000 = ENGINE.ratios.map(r => 1000 / (r * ENGINE.finalDrive) * ENGINE.tireCircM * 60 / 1000);
 
 let ctx, nodes, noiseBuf, mode = 'gps', unit = 'kmh';
-let targetKmh = 0, shownKmh = 0, prevKmh = 0, gear = 1, rpm = ENGINE.idle, throttle = 0;
+let targetKmh = 0, midKmh = 0, shownKmh = 0, prevKmh = 0, accel = 0, gear = 1, rpm = ENGINE.idle, throttle = 0, drivePace = 0;
 let watchId = null, lastFix = null;
-let lastShift = 0, shiftCutUntil = 0, blipUntil = 0, crackleUntil = 0, throttlePeak = 0, overrun = false;
+let lastShift = 0, shiftCutUntil = 0, blipUntil = 0, crackleUntil = 0, lastLiftCrackle = 0, throttlePeak = 0, overrun = false;
 
 const $ = id => document.getElementById(id);
 const lerp = (a, b, x) => a + (b - a) * x;
@@ -188,22 +188,38 @@ function updateAudio(dt) {
 function step(dt) {
   const now = performance.now();
   const src = mode === 'test' ? +$('testSpeed').value * (unit === 'mph' ? 1.609 : 1) : targetKmh;
-  // GPS arrives ~1 Hz, so glide toward it instead of jumping
-  shownKmh += (src - shownKmh) * Math.min(1, dt * 2.5);
-  const accel = (shownKmh - prevKmh) / Math.max(dt, 1e-3);  // km/h per second
+  // GPS arrives ~1 Hz with a few km/h of noise. Two cascaded smoothers turn each step into a gentle S-curve.
+  const a1 = 1 - Math.exp(-dt / 0.7);
+  midKmh += (src - midKmh) * a1;
+  shownKmh += (midKmh - shownKmh) * a1;
+  const rawAccel = (shownKmh - prevKmh) / Math.max(dt, 1e-3);  // km/h per second
   prevKmh = shownKmh;
+  accel += (rawAccel - accel) * (1 - Math.exp(-dt / 1.2));
 
-  // Throttle guess: acceleration (an NC pulls ~12 km/h/s flat out in 2nd) plus a little road load when cruising
-  overrun = accel < -1.5;
-  let want = overrun ? 0 : clamp01(accel / 12 + (shownKmh > 5 ? 0.12 : 0));
+  // Throttle guess: acceleration (an NC pulls ~12 km/h/s flat out in 2nd) plus a little road load when cruising.
+  // Small speed changes are just GPS noise or holding speed, so treat them as steady cruise.
+  const DEADBAND = 1.5;
+  const effAccel = Math.abs(accel) < DEADBAND ? 0 : accel - Math.sign(accel) * DEADBAND;
+  overrun = effAccel < -1.5;
+  const driverWant = overrun ? 0 : clamp01(effAccel / 10 + (shownKmh > 5 ? 0.15 : 0));
+  let want = driverWant;
   if (now < shiftCutUntil) want = 0;                       // clutch in during an upshift
   if (now < blipUntil) want = 0.6;                         // heel-toe blip on a downshift
-  throttle += (want - throttle) * Math.min(1, dt * 6);
+  // Shift/blip changes are deliberate and quick; everything else eases in
+  const quick = now < shiftCutUntil || now < blipUntil;
+  throttle += (want - throttle) * (1 - Math.exp(-dt / (quick ? 0.05 : 0.35)));
+  // Slow "how hard am I driving" signal for shift points, so one noisy fix can't move them
+  drivePace += (throttle - drivePace) * (1 - Math.exp(-dt / 2.5));
 
   // Lift-off from real load at high rpm → crackle burst
-  throttlePeak = Math.max(throttle, throttlePeak - dt * 0.8);
-  if (want < 0.05 && throttlePeak > 0.35 && rpm > 3200 && now > crackleUntil + 1500) {
+  // Remember recent load for a few seconds: smoothed decel takes a moment to show up after you lift
+  throttlePeak = Math.max(throttle, throttlePeak - dt * 0.15);
+  // Lifted = off the gas, or already slowing with throttle well under the recent average.
+  // (driverWant, not want: the throttle cut during an upshift isn't a lift)
+  const lifted = driverWant < 0.05 || (accel < -0.5 && throttle < drivePace - 0.3);
+  if (lifted && throttlePeak > 0.35 && rpm > 3200 && now - lastLiftCrackle > 3000) {
     crackleUntil = now + 700 + Math.random() * 1100;
+    lastLiftCrackle = now;
     throttlePeak = 0;
   }
 
@@ -211,10 +227,16 @@ function step(dt) {
   if (gear === 0) gear = 1;
   const rpmIn = g => shownKmh / KMH_PER_1000[g - 1] * 1000;
   // Short-shift when cruising, wring it out under load
-  const upAt = lerp(3000, 6900, clamp01(throttle * 1.4));
-  const downAt = lerp(1400, 2600, throttle);
-  if (now - lastShift > 700) {
-    if (rpmIn(gear) > upAt && gear < ENGINE.ratios.length) {
+  // Wide gap between up/down points + minimum time in gear = no gear hunting at a steady speed
+  // pace = load above plain cruising (0.15), so steady driving short-shifts like a normal driver
+  const pace = clamp01((drivePace - 0.15) / 0.85);
+  const upAt = lerp(2800, 6900, clamp01(Math.max(pace, (throttle - 0.45) / 0.55) * 1.3));
+  const downAt = lerp(1300, 2400, pace);
+  if (now - lastShift > 2000) {
+    // Nobody upshifts while coasting or easing off the gas (unless about to hit the limiter).
+    // Easing off = throttle well below the recent average; GPS smoothing shows this before real decel.
+    const coasting = overrun || driverWant < 0.05 || throttle < drivePace - 0.2;
+    if (rpmIn(gear) > (coasting ? ENGINE.redline - 200 : upAt) && gear < ENGINE.ratios.length) {
       gear++; lastShift = now; shiftCutUntil = now + 180;
       if (rpm > 4500) crackleUntil = now + 250;            // a pop or two on a hard upshift
     } else if (rpmIn(gear) < downAt && gear > 1) {
@@ -223,7 +245,8 @@ function step(dt) {
     }
   }
   const target = Math.max(ENGINE.idle, Math.min(ENGINE.redline, rpmIn(gear)));
-  rpm += (target - rpm) * Math.min(1, dt * 8);
+  // Fast right after a shift (the revs really do drop that fast), smooth otherwise
+  rpm += (target - rpm) * (1 - Math.exp(-dt / (now - lastShift < 400 ? 0.08 : 0.25)));
 }
 
 function render() {
